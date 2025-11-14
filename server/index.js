@@ -1,3 +1,4 @@
+// server/index.js
 import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
@@ -14,12 +15,12 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 app.use(cors());
 app.use(express.json());
 
-// Health check route
+// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Get all devices
+// === DEVICES CRUD ===
 app.get('/api/devices', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -35,15 +36,12 @@ app.get('/api/devices', async (req, res) => {
   }
 });
 
-// Create a new device
 app.post('/api/devices', async (req, res) => {
   try {
     const { name, ip_address, port, api_endpoint, is_active } = req.body;
 
     if (!name || !ip_address) {
-      return res
-        .status(400)
-        .json({ success: false, error: 'Name and IP address are required' });
+      return res.status(400).json({ success: false, error: 'Name and IP address are required' });
     }
 
     const { data, error } = await supabase
@@ -51,7 +49,7 @@ app.post('/api/devices', async (req, res) => {
       .insert({
         name,
         ip_address,
-        port: port || 80,
+        port: port || 4370,
         api_endpoint: api_endpoint || '/api/logs',
         is_active: is_active !== undefined ? is_active : true,
       })
@@ -66,7 +64,6 @@ app.post('/api/devices', async (req, res) => {
   }
 });
 
-// Update a device
 app.put('/api/devices/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -87,7 +84,6 @@ app.put('/api/devices/:id', async (req, res) => {
   }
 });
 
-// Delete a device
 app.delete('/api/devices/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -105,32 +101,44 @@ app.delete('/api/devices/:id', async (req, res) => {
   }
 });
 
-// Get logs
+// === LOGS ENDPOINT (Supports single device or all via RPC) ===
 app.get('/api/logs', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
     const deviceId = req.query.device_id;
 
-    let query = supabase
-      .from('attendance_logs')
-      .select(`
-        *,
-        devices:device_id (
-          id,
-          name,
-          ip_address
-        )
-      `)
-      .order('timestamp', { ascending: false })
-      .limit(limit);
+    let data = [];
+    let error = null;
 
     if (deviceId) {
-      query = query.eq('device_id', deviceId);
+      // Single device: direct query
+      const tableName = `attendance_logs_${deviceId}`;
+      const result = await supabase
+        .from(tableName)
+        .select(`
+          *,
+          devices!inner (
+            id,
+            name,
+            ip_address
+          )
+        `)
+        .order('timestamp', { ascending: false })
+        .limit(limit);
+
+      data = result.data || [];
+      error = result.error;
+    } else {
+      // All devices: use RPC function
+      const result = await supabase
+        .rpc('get_all_device_logs', { p_limit: limit });
+
+      data = result.data || [];
+      error = result.error;
     }
 
-    const { data, error } = await query;
-
     if (error) throw error;
+
     res.json({ success: true, data });
   } catch (error) {
     console.error('Error fetching logs:', error);
@@ -140,8 +148,7 @@ app.get('/api/logs', async (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📊 Polling devices every 10 seconds...`);
-
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Polling devices every 10 seconds...`);
   startDevicePolling(supabase);
 });

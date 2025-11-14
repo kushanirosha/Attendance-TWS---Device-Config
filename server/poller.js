@@ -1,9 +1,22 @@
 // server/poller.js
 import ZKLib from 'node-zklib';
 
-const POLL_INTERVAL = 10000; // 10 seconds
+const POLL_INTERVAL = 10000;
+
+// HARD‑CODED: Device Name → Table + Event Type
+const DEVICE_CONFIG = {
+  'Check-In': {
+    table: 'attendance_logs_check_in',
+    event_type: 'check_in'
+  },
+  'Check-Out': {
+    table: 'attendance_logs_check_out',
+    event_type: 'check_out'
+  }
+};
 
 export function startDevicePolling(supabase) {
+  console.log('Polling devices every 10 seconds...');
   pollAllDevices(supabase);
   setInterval(() => pollAllDevices(supabase), POLL_INTERVAL);
 }
@@ -15,174 +28,122 @@ async function pollAllDevices(supabase) {
       .select('*')
       .eq('is_active', true);
 
-    if (error) {
-      console.error('❌ Error fetching devices:', error);
-      return;
-    }
-
-    if (!devices?.length) {
-      console.log('⚠️ No active devices configured for polling');
-      return;
-    }
-
-    console.log(`🔄 Polling ${devices.length} device(s)...`);
+    if (error) throw error;
+    if (!devices?.length) return console.log('No active devices');
 
     for (const device of devices) {
-      if (device.port === 4370 || device.device_type === 'zkteco') {
-        await pollZKTecoDevice(device, supabase);
-      } else {
-        console.log(`⚠️ Skipping ${device.name} (unsupported port ${device.port})`);
+      const config = DEVICE_CONFIG[device.name];
+      if (!config) {
+        console.warn(`No config for device: ${device.name}`);
+        continue;
       }
+      await pollZKTecoDevice(device, supabase, config);
     }
   } catch (err) {
-    console.error('❌ Error in polling cycle:', err);
+    console.error('Polling error:', err);
   }
 }
 
-async function getLastUserSn(supabase, deviceId) {
+async function getLastUserSn(supabase, tableName) {
   try {
     const { data, error } = await supabase
-      .from('attendance_logs')
+      .from(tableName)
       .select('user_sn')
-      .eq('device_id', deviceId)
       .order('user_sn', { ascending: false })
       .limit(1)
       .maybeSingle();
 
-    if (error) {
-      console.warn('⚠️ getLastUserSn query error:', error);
-      return 0;
-    }
-
-    const lastUserSn = Number(data?.user_sn || 0);
-    console.log(`📘 Last userSn for device ${deviceId}: ${lastUserSn}`);
-    return lastUserSn;
+    if (error && error.code !== 'PGRST116') return 0;
+    return Number(data?.user_sn || 0);
   } catch (err) {
-    console.error('❌ getLastUserSn error:', err);
     return 0;
   }
 }
 
-async function pollZKTecoDevice(device, supabase) {
+async function pollZKTecoDevice(device, supabase, config) {
   const zk = new ZKLib(device.ip_address, device.port || 4370, 20000);
-  console.log(`📡 Connecting to ZKTeco device: ${device.name}`);
+  console.log(`Connecting to ${device.name} → ${config.table}`);
 
   try {
     await zk.createSocket();
-    console.log(`✅ Connected to ${device.name}`);
+    console.log(`Connected to ${device.name}`);
 
-    // Step 1: Get attendance logs
-    let rawLogs = [];
-    try {
-      const logs = await zk.getAttendances();
-      rawLogs = Array.isArray(logs) ? logs : logs?.data || [];
-    } catch (err) {
-      console.warn(`⚠️ Could not fetch attendances from ${device.name}:`, err.message || err);
-    }
+    const logs = await zk.getAttendances();
+    const rawLogs = Array.isArray(logs) ? logs : logs?.data || [];
 
     if (!rawLogs.length) {
-      console.log(`📭 ${device.name}: No new logs`);
-      await safeDisconnect(zk, device);
-      await updateDeviceStatus(supabase, device.id, 'online');
+      await updateStatus(supabase, device.id, 'online');
+      await disconnect(zk);
       return;
     }
 
-    // Step 2: Filter only new logs
-    const lastUserSn = await getLastUserSn(supabase, device.id);
-    const newLogs = rawLogs.filter(log => Number(log.userSn) > Number(lastUserSn));
+    const lastUserSn = await getLastUserSn(supabase, config.table);
+    const newLogs = rawLogs.filter(l => Number(l.userSn) > lastUserSn);
 
     if (!newLogs.length) {
-      console.log(`📭 ${device.name}: No new logs beyond userSn ${lastUserSn}`);
-      await safeDisconnect(zk, device);
-      await updateDeviceStatus(supabase, device.id, 'online');
+      console.log(`${device.name}: No new logs`);
+      await updateStatus(supabase, device.id, 'online');
+      await disconnect(zk);
       return;
     }
 
-    console.log(`🆕 ${device.name}: Found ${newLogs.length} new log(s)`);
+    console.log(`${device.name}: Found ${newLogs.length} new log(s)`);
 
-    // Step 3: Fetch employee names from Supabase employees table
-    const employeeIds = Array.from(
-      new Set(newLogs.map(l => String(l.deviceUserId)))
-    );
-
-    const { data: employees, error: empError } = await supabase
+    // Get employee names (only for existing IDs)
+    const empIds = [...new Set(newLogs.map(l => String(l.deviceUserId)))];
+    const { data: employees = [] } = await supabase
       .from('employees')
       .select('id, name')
-      .in('id', employeeIds);
+      .in('id', empIds);
 
-    if (empError) {
-      console.warn('⚠️ Error fetching employee names:', empError);
-    }
+    const empMap = {};
+    employees.forEach(e => empMap[String(e.id)] = e.name);
 
-    const employeeMap = {};
-    if (employees?.length) {
-      employees.forEach(emp => {
-        employeeMap[String(emp.id)] = emp.name;
-      });
-    }
-
-    // Step 4: Prepare logs
-    const formattedLogs = newLogs.map(l => ({
+    // Format EVERY log – name = null if not found
+    const formatted = newLogs.map(l => ({
       device_id: device.id,
       employee_id: String(l.deviceUserId),
-      employee_name: employeeMap[String(l.deviceUserId)] || null, // from DB
+      employee_name: empMap[String(l.deviceUserId)] || null,   // ← NULL if missing
+      user_sn: Number(l.userSn),
       timestamp: l.recordTime,
       method: 'fingerprint',
-      event_type: 'check_out',
+      event_type: config.event_type,
       raw_data: l,
     }));
 
-    // console.log('🧾 Example formatted log:', formattedLogs[0]);
-
-    // Step 5: Save logs
-    await saveLogsToDatabase(supabase, device.id, formattedLogs);
-
-    await safeDisconnect(zk, device);
-    await updateDeviceStatus(supabase, device.id, 'online');
+    // INSERT ALL – no skipping
+    await saveAllLogs(supabase, config.table, formatted);
+    await updateStatus(supabase, device.id, 'online');
   } catch (err) {
-    console.error(`❌ Error polling ${device.name}:`, err.message || err);
-    await safeDisconnect(zk, device);
-    await updateDeviceStatus(supabase, device.id, 'offline');
+    console.error(`Error polling ${device.name}:`, err.message || err);
+    await updateStatus(supabase, device.id, 'offline');
+  } finally {
+    await disconnect(zk);
   }
 }
 
-async function saveLogsToDatabase(supabase, deviceId, logs) {
+// INSERT ALL LOGS – even with missing employee
+async function saveAllLogs(supabase, tableName, logs) {
   if (!logs.length) return;
 
   try {
-    const sanitized = logs.map(({ user_sn, ...rest }) => rest);
-    const { error } = await supabase.from('attendance_logs').insert(sanitized);
-
-    if (error) {
-      console.error('❌ Supabase insert error:', error);
-    } else {
-      console.log(`💾 Saved ${logs.length} new logs for device ${deviceId}`);
-    }
+    const { error } = await supabase.from(tableName).insert(logs);
+    if (error) throw error;
+    console.log(`Saved ${logs.length} logs → ${tableName}`);
   } catch (err) {
-    console.error('❌ Error saving logs to database:', err);
+    console.error(`Failed to save logs to ${tableName}:`, err);
   }
 }
 
-async function updateDeviceStatus(supabase, deviceId, status) {
+async function updateStatus(supabase, deviceId, status) {
   try {
     await supabase
       .from('devices')
-      .update({
-        status,
-        last_poll_at: new Date().toISOString(),
-      })
+      .update({ status, last_poll_at: new Date().toISOString() })
       .eq('id', deviceId);
-    console.log(`ℹ️ Updated device ${deviceId} status to '${status}'`);
-  } catch (err) {
-    console.error('❌ Error updating device status:', err);
-  }
+  } catch (_) {}
 }
 
-async function safeDisconnect(zk, device) {
-  try {
-    await zk.disconnect();
-    console.log(`🔌 Disconnected from ${device.name}`);
-  } catch (err) {
-    console.warn(`⚠️ Could not disconnect from ${device.name}:`, err.message || err);
-  }
+async function disconnect(zk) {
+  try { await zk.disconnect(); } catch (_) {}
 }
